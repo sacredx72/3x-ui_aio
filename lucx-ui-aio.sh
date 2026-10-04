@@ -1,6 +1,13 @@
 #!/bin/bash
 ###############################################################################
-#  LucX-UI All-in-One Installer  v10 (2026)
+#  LucX-UI All-in-One Installer  v11 (2026)
+#  ─────────────────────────────────────────────────────────────────────────────
+#  v11: Hysteria2/MTProto в settings.clients[] (auth / FakeTLS secret); пины
+#  версий LucX-UI/AGH + SHA256; панель/подписка/vhost/REALITY только 127.0.0.1;
+#  AGH API без корневого /control/; DoT — TLS в nginx → plain DNS AGH;
+#  UFW: автоопределение SSH, deny routed (кроме AWG), только нужные порты;
+#  fail2ban (sshd + honeypot); certbot без остановки nginx; бэкап + откат nginx;
+#  строгая валидация env; секреты не попадают в лог установки.
 #  ─────────────────────────────────────────────────────────────────────────────
 #  v10: keygen awg/wg/cryptography + validate; AWG seed keys+allowedIPs; AWG 3.1 defaults;
 #  AGH upstreams/filters; DoT after AGH; nginx panel SSL + no 502→404 mask.
@@ -66,6 +73,8 @@ rm -f /tmp/lucx-syntax-err
 LOG_FILE="/root/lucx-ui-install.log"
 mkdir -p /root
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || true
+# fd 3 — исходный stdout (терминал): учётные данные выводятся только туда, не в лог
+exec 3>&1
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ─── Root check ─────────────────────────────────────────────────────────────
@@ -77,13 +86,17 @@ case "${ID:-}" in
     ubuntu|debian) ;;
     *) die "Поддерживаются только Ubuntu 24.04/26.04 и Debian 12/13. Обнаружено: ${ID:-unknown}" ;;
 esac
+case "${ID}:${VERSION_ID:-}" in
+    ubuntu:24.04|ubuntu:26.04|debian:12|debian:13) ;;
+    *) warn "ОС ${ID} ${VERSION_ID:-?} не тестировалась (поддержка: Ubuntu 24.04/26.04, Debian 12/13)" ;;
+esac
 
 # ─── Архитектура ────────────────────────────────────────────────────────────
 get_arch() {
     case "$(uname -m)" in
         x86_64|x64|amd64)           echo 'amd64'  ;;
-        armv8*|armv8|arm64|aarch64) echo 'arm64'  ;;
-        armv7*|armv7|arm)           echo 'armv7'  ;;
+        armv8*|arm64|aarch64)       echo 'arm64'  ;;
+        armv7*|arm)                 echo 'armv7'  ;;
         i*86|x86)                   echo '386'    ;;
         *) die "Неподдерживаемая архитектура: $(uname -m)" ;;
     esac
@@ -147,20 +160,29 @@ DEFAULT_ENV_FILE="${SCRIPT_DIR}/aio.env"
 #   ПЕРЕМЕННАЯ = "значение"
 #   (пробелы вокруг "=" допускаются; inline-комментарии — через " #")
 # Пустая строка = переменная задаётся пустой (скрипт запросит/сгенерирует).
+# Разрешённые переменные env-файла (остальные игнорируются с предупреждением)
+ENV_ALLOWED_RE='^((REALITY_|TG_WEB_|XHTTP_R_|GRPC_R_|TT_)?DOMAIN|PANEL_USER|PANEL_PASS|AGH_USER|AGH_PASS|INSTALL_ADGUARD|SKIP_PKG|SKIP_CLEANUP|LUCX_VERSION|AGH_VERSION|TIMEZONE|SSH_PORTS|[A-Z0-9_]+_PORT|AWG[0-9]+_SUBNET|AMNEZIAWG_SUBNET)$'
 load_env_file() {
     local f="$1" line name value
     [[ -f "$f" ]] || return 0
     inf "Конфигурация из файла: $f"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line//[$'\r']/}"                      # убрать CR (Windows)
-        name=$(printf '%s\n' "$line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=[[:space:]]*.*$/\1/p')
-        [[ -n "$name" ]] || continue
-        value=$(printf '%s\n' "$line" | sed -n 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*\(.*\)$/\1/p')
-        value="${value%% #*}"                          # срезать inline-комментарий
-        value="$(printf '%s' "$value" | sed 's/[[:space:]]*$//')"   # правый trim
-        value="${value#\"}"; value="${value%\"}"        # снять двойные кавычки
-        value="${value#\'}"; value="${value%\'}"        # снять одинарные
-        export "$name=$value"
+        line="${line//$'\r'/}"                         # убрать CR (Windows)
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        name="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+        if [[ "$value" =~ ^\"([^\"]*)\" || "$value" =~ ^\'([^\']*)\' ]]; then
+            value="${BASH_REMATCH[1]}"                 # в кавычках '#' — часть значения
+        else
+            [[ "$value" == \#* ]] && value=""
+            value="${value%%[[:space:]]#*}"            # inline-комментарий
+            value="${value%"${value##*[![:space:]]}"}" # правый trim
+        fi
+        if [[ ! "$name" =~ $ENV_ALLOWED_RE ]]; then
+            warn "env: неизвестная переменная ${name} — пропущена"
+            continue
+        fi
+        printf -v "$name" '%s' "$value"
+        export "${name?}"
     done < "$f"
 }
 
@@ -243,8 +265,8 @@ AGH_PASS="${AGH_PASS:-$(rand_str 20)}"
 # Панель (порт можно переопределить в env-файле; пусто — случайный свободный)
 PANEL_PORT=$(pick_port PANEL_PORT)         # internal web UI
 SUB_PORT=$(pick_port SUB_PORT)             # subscription server (панель, loopback)
-# LucX sub-sidecar (x-tuna): Throne amneziawg://→wg://, mieru/anytls/tt фиксы
-SIDECAR_PORT=$(pick_port SIDECAR_PORT)
+# Порт certbot standalone (loopback) для продления через nginx :80 без остановки nginx
+ACME_PORT=$(pick_port ACME_PORT)
 
 # XRAY внутренние порты (слушают 127.0.0.1, nginx проксирует)
 VLESS_WS_PORT=$(pick_port VLESS_WS_PORT)
@@ -318,24 +340,25 @@ VMESS_WS_PATH="/$(rand_str 12)"
 DIAG_TOKEN=$(rand_str 16)
 DIAG_PATH="/net-$(rand_str 12)/"
 TPROXY_SECRET=$(rand_hex 16)   # 32 hex-символа (16 байт) — секрет tproxy
-MTR_PORT=$(pick_port MTR_PORT)
 # AdGuard Home — порты web-UI и plain-DNS (loopback 127.0.0.1; наружу — nginx)
 AGH_WEB_PORT=$(pick_port AGH_WEB_PORT)
 AGH_DNS_PORT=$(pick_port AGH_DNS_PORT)
-# Web-UI AGH слушает ТОЛЬКО plain HTTP (port_https=0 в yaml).
-# TLS снаружи терминирует nginx; DoT — отдельный loopback-порт AGH_DOT_PORT.
-# AGH_WEB_TLS_PORT больше не используется для прокси (оставлен для совместимости env).
-AGH_WEB_TLS_PORT="${AGH_WEB_TLS_PORT:-0}"
-# Внутренний DoT-порт AGH (loopback); снаружи 853 слушает nginx stream
-AGH_DOT_PORT=$(pick_port AGH_DOT_PORT)
+# Web-UI AGH — только plain HTTP; TLS (DoH и DoT :853) терминирует nginx.
 AGH_PATH="adg-$(rand_str 12)"
 
 # Учётные данные панели (можно задать в env-файле; пусто — случайные)
-[[ -n "$PANEL_USER" ]] || PANEL_USER=$(rand_str 10)
-[[ -n "$PANEL_PASS" ]] || PANEL_PASS=$(rand_str 14)
+[[ -n "${PANEL_USER:-}" ]] || PANEL_USER=$(rand_str 10)
+[[ -n "${PANEL_PASS:-}" ]] || PANEL_PASS=$(rand_str 14)
 
 # Константы
 LUCX_REPO="AlexeyLCP/lucx-ui"
+# Закреплённые версии (проверены с этим скриптом). "latest" — последний релиз
+# (SHA256 проверяется всегда; совместимость latest не гарантируется).
+LUCX_VERSION="${LUCX_VERSION:-v3.9.0-lucx.280}"
+AGH_VERSION="${AGH_VERSION:-v0.107.79}"
+TIMEZONE="${TIMEZONE:-}"
+SSH_PORTS="${SSH_PORTS:-}"
+BACKUP_DIR="/root/lucx-backup-$(date +%Y%m%d-%H%M%S)"
 XUIDB="/etc/x-ui/x-ui.db"
 # Первый тестовый клиент подписки (ссылки Sub/JSON/Clash/AWG в отчёте)
 # v10.1: автосоздание первого клиента убрано (ломало БД).
@@ -379,6 +402,10 @@ do_uninstall() {
           /etc/systemd/system/AdGuardHome.service \
           /etc/systemd/system/lucx-sub-sidecar.service
     rm -rf /usr/local/x-ui /etc/x-ui /etc/hysteria2 /etc/telegram-proxy /opt/AdGuardHome /opt/lucx-sub-sidecar
+    rm -f /etc/fail2ban/jail.d/lucx.conf /etc/fail2ban/filter.d/lucx-nginx-honeypot.conf \
+          /etc/letsencrypt/renewal-hooks/deploy/lucx-reload.sh \
+          /etc/systemd/system/nginx.service.d/after-adguard.conf
+    systemctl restart fail2ban 2>/dev/null || true
     rm -rf /etc/nginx/stream-enabled/* /etc/nginx/sites-enabled/* /etc/nginx/sites-available/*
     apt-get -y purge nginx nginx-full certbot 2>/dev/null || true
     apt-get -y autoremove 2>/dev/null || true
@@ -420,7 +447,7 @@ done
 
     # ── 2. Nginx: сброс конфигов УСТАНОВЩИКА (не трогаем сам nginx.conf) ─
     for d in /etc/nginx/stream-enabled /etc/nginx/snippets; do
-        [[ -d "$d" ]] && rm -rf "${d:?}"/. 2>/dev/null || true
+        [[ -d "$d" ]] && find "$d" -mindepth 1 -delete 2>/dev/null || true
     done
     [[ -d /etc/nginx/sites-enabled ]] && find /etc/nginx/sites-enabled -maxdepth 1 -type l -delete 2>/dev/null || true
     [[ -d /etc/nginx/sites-enabled ]] && find /etc/nginx/sites-enabled -maxdepth 1 -type f ! -name default -delete 2>/dev/null || true
@@ -455,8 +482,8 @@ done
     pkill -f '/opt/AdGuardHome/AdGuardHome' 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
 
-    # certbot/letsencrypt НЕ удаляем (перевыпустит поверх), /root/cert пересоздаётся
-    rm -rf /root/cert 2>/dev/null || true
+    # certbot/letsencrypt и симлинки /root/cert НЕ удаляем: get_certs обновит их,
+    # а откат конфига nginx при сбое продолжит находить сертификаты
 
     systemctl stop nginx 2>/dev/null || true
     ok "Старые компоненты очищены (бэкапы панели: /usr/local/x-ui.old.*, /etc/x-ui.old.*)"
@@ -521,7 +548,94 @@ collect_domains() {
     [[ -z "$TT_DOMAIN" ]]     && warn "Домен -u не задан — TrustTunnel будет на прямом порту (клиенты TT ходят только на 443!)"
 }
 collect_domains
-echo "[OK] After collect_domains, continuing to server IP detection..." >&2
+
+###############################################################################
+# ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ (значения попадают в SQL/YAML/nginx — только безопасные символы)
+###############################################################################
+is_valid_domain() {
+    [[ ${#1} -le 253 && "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+validate_inputs() {
+    local v
+    for v in DOMAIN REALITY_DOMAIN TG_WEB_DOMAIN XHTTP_R_DOMAIN GRPC_R_DOMAIN TT_DOMAIN; do
+        [[ -z "${!v}" ]] && continue
+        is_valid_domain "${!v}" || die "${v}='${!v}': некорректное доменное имя"
+        printf -v "$v" '%s' "${!v,,}"
+    done
+    for v in PANEL_USER AGH_USER; do
+        [[ "${!v}" =~ ^[A-Za-z0-9._-]{3,64}$ ]] || die "${v}: допустимо 3–64 символа [A-Za-z0-9._-]"
+    done
+    for v in PANEL_PASS AGH_PASS; do
+        [[ "${!v}" =~ ^[A-Za-z0-9._~@%+=:,^!*-]{8,128}$ ]] || \
+            die "${v}: 8–128 символов из [A-Za-z0-9._~@%+=:,^!*-] (без кавычек, пробелов, \\, \$, #, &, /)"
+    done
+    for v in LUCX_VERSION AGH_VERSION; do
+        [[ "${!v}" == latest || "${!v}" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || die "${v}='${!v}': ожидается тег вида v1.2.3 или latest"
+    done
+    if [[ -n "$TIMEZONE" && ! -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
+        die "TIMEZONE='${TIMEZONE}': нет в /usr/share/zoneinfo"
+    fi
+    for v in $SSH_PORTS; do
+        [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )) || die "SSH_PORTS: '${v}' — не порт"
+    done
+}
+validate_inputs
+
+###############################################################################
+# ЗАГРУЗКИ С ПРОВЕРКОЙ (staging → SHA256 → установка)
+###############################################################################
+download() {
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 -o "$2" "$1"
+}
+verify_sha256() {
+    local f="$1" want="${2,,}" got
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || return 1
+    got=$(sha256sum "$f" | awk '{print $1}')
+    [[ "$got" == "$want" ]]
+}
+# Тег последнего релиза без GitHub API (нет лимита 60 запросов/час)
+gh_latest_tag() {
+    local url
+    url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 15 --max-time 60 \
+        "https://github.com/$1/releases/latest" 2>/dev/null) || return 1
+    printf '%s\n' "${url##*/tag/}"
+}
+
+###############################################################################
+# БЭКАП ПЕРЕД ИЗМЕНЕНИЯМИ + ОТКАТ NGINX ПРИ СБОЕ
+###############################################################################
+backup_state() {
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR" || die "Не удалось создать ${BACKUP_DIR}"
+    [[ -d /etc/nginx ]] && cp -a /etc/nginx "${BACKUP_DIR}/nginx"
+    if [[ -f "$XUIDB" ]]; then
+        if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$XUIDB" ".backup '${BACKUP_DIR}/x-ui.db'" 2>/dev/null || cp -a "$XUIDB" "${BACKUP_DIR}/x-ui.db"
+        else
+            cp -a "$XUIDB" "${BACKUP_DIR}/x-ui.db"
+        fi
+    fi
+    [[ -f /opt/AdGuardHome/AdGuardHome.yaml ]] && cp -a /opt/AdGuardHome/AdGuardHome.yaml "${BACKUP_DIR}/"
+    [[ -f /etc/ufw/before.rules ]] && cp -a /etc/ufw/before.rules "${BACKUP_DIR}/"
+    crontab -l > "${BACKUP_DIR}/crontab" 2>/dev/null || true
+    UFW_WAS_ACTIVE=0
+    ufw status 2>/dev/null | grep -q '^Status: active' && UFW_WAS_ACTIVE=1
+    ok "Бэкап текущего состояния: ${BACKUP_DIR}"
+}
+on_exit() {
+    local rc=$?
+    (( rc == 0 )) && return
+    err "Установка прервана (код ${rc}). Лог: ${LOG_FILE}"
+    if [[ -d "${BACKUP_DIR}/nginx" ]] && command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+        warn "Конфиг nginx невалиден — откат из ${BACKUP_DIR}/nginx"
+        rm -rf /etc/nginx && cp -a "${BACKUP_DIR}/nginx" /etc/nginx && \
+            { systemctl restart nginx 2>/dev/null || true; }
+    fi
+    if [[ "${UFW_WAS_ACTIVE:-0}" == 1 ]] && ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+        warn "UFW был активен до установки — включаю обратно"
+        ufw --force enable >/dev/null 2>&1 || err "ufw enable не удался — включите firewall вручную"
+    fi
+    [[ -d "$BACKUP_DIR" ]] && err "Бэкап (БД панели, AGH yaml, UFW, crontab): ${BACKUP_DIR}"
+}
 
 # Получаем IP сервера
 SERVER_IP4=""
@@ -542,6 +656,8 @@ apt-get update -qq 2>/dev/null || true
 
 # Очистка предыдущих установок (nginx/панель/sidecar) — чтобы не было
 # конфликтов портов и конфигов при установке. Отключить: --no-cleanup
+backup_state
+trap on_exit EXIT
 if [[ "$SKIP_CLEANUP" != "y" ]]; then
     cleanup_old
 fi
@@ -556,7 +672,7 @@ install_packages() {
     apt-get install -y -qq --no-install-recommends \
         curl wget jq socat ca-certificates openssl gnupg2 lsb-release \
         nginx-full certbot python3-certbot-nginx \
-        sqlite3 ufw fail2ban \
+        sqlite3 ufw fail2ban python3-systemd apache2-utils \
         net-tools netcat-openbsd \
         build-essential libmnl-dev pkg-config dkms git \
         python3 python3-cryptography xxd mtr || die "apt-get install завершился с ошибкой"
@@ -578,6 +694,7 @@ get_certs() {
     
     inf "  шаг 2: запрос сертификатов..."
     local cert_domains=()
+    CERT_DOMAINS=()
     cert_domains+=("$DOMAIN")
     cert_domains+=("$REALITY_DOMAIN")
     # TT и tproxy проверяют PEM-сертификат на покрытие hostname — им нужен cert
@@ -600,10 +717,12 @@ get_certs() {
     done
     [[ $failed -gt 0 ]] && die "$failed домен(ов) без сертификата. Проверьте DNS A-запись → ${SERVER_IP4}"
 
+    CERT_DOMAINS=("${cert_domains[@]}")
     # Симлинки в /root/cert/<domain>/
+    mkdir -p /root/cert && chmod 700 /root/cert
     for d in "${cert_domains[@]}"; do
         mkdir -p "/root/cert/${d}"
-        chmod 755 "/root/cert/${d}"
+        chmod 700 "/root/cert/${d}"
         ln -sf "/etc/letsencrypt/live/${d}/fullchain.pem" "/root/cert/${d}/fullchain.pem"
         ln -sf "/etc/letsencrypt/live/${d}/privkey.pem"   "/root/cert/${d}/privkey.pem"
     done
@@ -617,88 +736,61 @@ get_certs
 install_panel() {
     inf "Установка LucX-UI (${LUCX_REPO})..."
 
-    inf "  Запрос версии с GitHub (may take a few seconds)..."
-    local tag
-    tag=$(curl -Ls --retry 5 --retry-delay 3 --connect-timeout 20 --max-time 60 \
-        "https://api.github.com/repos/${LUCX_REPO}/releases/latest" \
-        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    [[ -z "$tag" ]] && die "Не удалось получить версию LucX-UI с GitHub"
+    local tag="$LUCX_VERSION"
+    if [[ "$tag" == "latest" ]]; then
+        tag=$(gh_latest_tag "$LUCX_REPO") || tag=""
+    fi
+    [[ -n "$tag" ]] || die "Не удалось определить версию LucX-UI"
     inf "  Версия: ${tag}"
 
-    inf "  Загрузка архива x-ui-linux-${ARCH}.tar.gz (${tag})..."
-    cd /usr/local/
-    [[ -d /usr/local/x-ui ]] && { systemctl stop x-ui 2>/dev/null || true; rm -rf /usr/local/x-ui; }
+    local asset="x-ui-linux-${ARCH}.tar.gz"
+    local rel="https://github.com/${LUCX_REPO}/releases/download/${tag}"
+    local stage
+    stage=$(mktemp -d /root/.lucx-stage.XXXXXX) || die "mktemp не сработал"
+    inf "  Загрузка ${asset} (${tag})..."
+    download "${rel}/${asset}" "${stage}/${asset}" || die "Ошибка загрузки LucX-UI ${tag}"
+    download "${rel}/${asset}.sha256" "${stage}/${asset}.sha256" \
+        || die "В релизе ${tag} нет ${asset}.sha256 — непроверенный архив не устанавливаю"
+    verify_sha256 "${stage}/${asset}" "$(awk '{print $1; exit}' "${stage}/${asset}.sha256")" \
+        || die "SHA256 архива LucX-UI не совпадает — архив повреждён или подменён"
+    ok "  Архив загружен, SHA256 совпадает"
 
-    wget -q -O /tmp/x-ui.tar.gz \
-        "https://github.com/${LUCX_REPO}/releases/download/${tag}/x-ui-linux-${ARCH}.tar.gz" \
-        || die "Ошибка загрузки LucX-UI"
-    ok "  Архив загружен"
+    tar -xzf "${stage}/${asset}" -C "$stage" || die "Ошибка распаковки LucX-UI"
+    [[ -x "${stage}/x-ui/x-ui" ]] || die "В архиве нет исполняемого x-ui"
+    local pins="${stage}/x-ui/bin/lucx-pins.txt" pin_name pin_sum bad=0
+    if [[ -f "$pins" ]]; then
+        while read -r pin_name pin_sum; do
+            [[ -n "$pin_name" && -f "${stage}/x-ui/bin/${pin_name}" ]] || continue
+            verify_sha256 "${stage}/x-ui/bin/${pin_name}" "$pin_sum" || { err "  ${pin_name}: SHA256 не совпадает с lucx-pins.txt"; bad=$((bad+1)); }
+        done < "$pins"
+        (( bad == 0 )) || die "Sidecar-бинарники не прошли проверку lucx-pins.txt"
+        ok "  Sidecar-бинарники сверены с lucx-pins.txt"
+    fi
 
-    inf "  Распаковка..."
-    tar -xzf /tmp/x-ui.tar.gz
-    rm -f /tmp/x-ui.tar.gz
-    cd x-ui
+    # Атомарная замена: старая версия → /usr/local/x-ui.prev
+    systemctl stop x-ui 2>/dev/null || true
+    if [[ -d /usr/local/x-ui ]]; then
+        rm -rf /usr/local/x-ui.prev
+        mv /usr/local/x-ui /usr/local/x-ui.prev || die "Не удалось сохранить предыдущую версию панели"
+    fi
+    mv "${stage}/x-ui" /usr/local/x-ui || die "Не удалось установить /usr/local/x-ui"
+    rm -rf "$stage"
+    cd /usr/local/x-ui || die "Нет /usr/local/x-ui"
     chmod +x x-ui x-ui.sh 2>/dev/null || true
-
-    inf "  Sidecar-бинарники (amd64)..."
     mkdir -p bin
-    if [[ "$ARCH" == "amd64" ]]; then
-        local SIDECARS=(
-            caddy-naive-linux-amd64
-            naive-client-linux-amd64
-            olcrtc-linux-amd64
-            qwdtt-linux-amd64
-            mieru-linux-amd64
-            mieru-client-linux-amd64
-            trusttunnel-linux-amd64
-            trusttunnel-client-linux-amd64
-            anytls-linux-amd64
-        )
-        local LUCX_RAW="https://raw.githubusercontent.com/${LUCX_REPO}/main"
-        local fetched=0 failed=0
-        for name in "${SIDECARS[@]}"; do
-            local gz_path="third_party/sidecars/linux-amd64/${name}.gz"
-            local tmp="bin/${name}.gz"
-            # Сначала пробуем взять из распакованного архива
-            if [[ -s "${gz_path}" ]]; then
-                gzip -dc "${gz_path}" > "bin/${name}" 2>/dev/null && chmod +x "bin/${name}" && { fetched=$((fetched+1)); continue; }
-            fi
-            # Иначе — с GitHub raw
-            if curl -fLR --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
-                    -o "${tmp}" "${LUCX_RAW}/${gz_path}" 2>/dev/null; then
-                if gzip -dc "${tmp}" > "bin/${name}" 2>/dev/null && chmod +x "bin/${name}"; then
-                    fetched=$((fetched+1))
-                else
-                    failed=$((failed+1))
-                fi
-                rm -f "${tmp}"
-            else
-                warn "  Sidecar ${name}: не найден, пропускаю"
-                failed=$((failed+1))
-            fi
-        done
-        ok "  Sidecar: ${fetched} загружено, ${failed} пропущено"
+    chmod +x bin/*-linux-* 2>/dev/null || true
 
-        inf "  Telegram WEB proxy (tproxy) — бинарники best-effort..."
-        if [[ -n "$TG_WEB_DOMAIN" ]]; then
-            local t_ok=0 t_fail=0
-            for core_name in tproxy-linux-amd64 mtproxy-linux-amd64; do
-                [[ -s "bin/${core_name}" ]] && { t_ok=$((t_ok+1)); continue; }
-                curl -fLR --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 180 \
-                    -o "bin/${core_name}.gz" \
-                    "https://github.com/${LUCX_REPO}/releases/latest/download/${core_name}.gz" 2>/dev/null \
-                && gzip -dc "bin/${core_name}.gz" > "bin/${core_name}" 2>/dev/null \
-                && chmod +x "bin/${core_name}" && { t_ok=$((t_ok+1)); rm -f "bin/${core_name}.gz"; continue; }
-                rm -f "bin/${core_name}.gz"
-                warn "  ${core_name}: не загружен (можно доустановить в панели: Cores)"
-                t_fail=$((t_fail+1))
-            done
-            ok "  tproxy: ${t_ok} готово, ${t_fail} пропущено"
-        else
-            ok "  tproxy пропущен (нет -t / TG_WEB_DOMAIN)"
-        fi
+    local missing=() sc
+    for sc in caddy-naive olcrtc qwdtt mieru trusttunnel anytls mtg; do
+        compgen -G "bin/${sc}-linux-*" >/dev/null || missing+=("$sc")
+    done
+    [[ -n "$TG_WEB_DOMAIN" ]] && for sc in tproxy mtproxy; do
+        compgen -G "bin/${sc}-linux-*" >/dev/null || missing+=("$sc")
+    done
+    if (( ${#missing[@]} )); then
+        warn "  В архиве ${ARCH} нет sidecar: ${missing[*]} (доустановка в панели: Cores)"
     else
-        ok "  Sidecar: пропущен (архитектура ≠ amd64; панель доустановит в Cores)"
+        ok "  Sidecar-бинарники на месте"
     fi
 
     inf "  Geo-файлы (geoip.dat, geosite.dat)..."
@@ -728,22 +820,20 @@ install_panel() {
         fi
     done
 
-    inf "  CLI-скрипт x-ui..."
-    if curl -fsSL --retry 3 --connect-timeout 15 \
-        "https://raw.githubusercontent.com/${LUCX_REPO}/main/x-ui.sh" \
-        -o /usr/bin/x-ui 2>/dev/null; then
-        ok "  x-ui CLI загружен"
+    inf "  CLI-скрипт x-ui (из проверенного архива)..."
+    if install -m 755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui 2>/dev/null; then
+        ok "  x-ui CLI установлен"
     else
-        warn "  x-ui CLI не загружен (можно вручную: cp x-ui.sh /usr/bin/x-ui)"
+        warn "  x-ui CLI не установлен (нет x-ui.sh в архиве)"
     fi
-    chmod +x /usr/bin/x-ui 2>/dev/null || true
     mkdir -p /var/log/x-ui
 
     inf "  Первичная конфигурация панели..."
     /usr/local/x-ui/x-ui setting \
         -username "$PANEL_USER" -password "$PANEL_PASS" \
-        -port "$PANEL_PORT" -webBasePath "${PANEL_PATH}" 2>/dev/null || true
-    /usr/local/x-ui/x-ui migrate 2>/dev/null || true
+        -port "$PANEL_PORT" -webBasePath "${PANEL_PATH}" -listenIP 127.0.0.1 >/dev/null 2>&1 \
+        || warn "  x-ui setting завершился с ошибкой"
+    /usr/local/x-ui/x-ui migrate >/dev/null 2>&1 || warn "  x-ui migrate завершился с ошибкой"
 
     inf "  Systemd unit..."
     local svc_file="x-ui.service"
@@ -752,8 +842,8 @@ install_panel() {
 
     systemctl daemon-reload
     systemctl enable x-ui
-    systemctl start x-ui
-    sleep 2   # дать панели создать БД
+    systemctl start x-ui || die "x-ui не запустился — journalctl -u x-ui"
+    for _ in $(seq 1 20); do [[ -f "$XUIDB" ]] && break; sleep 1; done
 
     ok "LucX-UI ${tag} установлен"
 }
@@ -851,7 +941,8 @@ ${extra_stream_map}${tg_stream_map}
 }
 upstream reality_upstream { server 127.0.0.1:8443; }
 upstream panel_upstream   { server 127.0.0.1:7443; }
-${extra_stream_upstream}${tg_stream_upstream}
+${extra_stream_upstream}
+${tg_stream_upstream}
 
 # v7.3 FIX: proxy_protocol on — иначе HTTP на 7443 видит только 127.0.0.1
 # (stream L4 без PP), и AGH/панель показывают localhost вместо реальных IP.
@@ -862,10 +953,10 @@ server {
     proxy_protocol on;
     proxy_pass \$sni_route;
 }
-${tt_strip_server}${tg_strip_server}
+${tt_strip_server}
+${tg_strip_server}
 
-# v10: DoT :853 пишется ПОСЛЕ старта AdGuardHome (setup_adguard),
-# чтобы nginx не слушал 853, пока AGH DoT не up.
+# DoT :853 — отдельный stream-конфиг dot-853.conf (setup_adguard)
 STREAM
 
     # ── HTTP → HTTPS redirect ─────────────────────────────────────────────
@@ -875,7 +966,13 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    return 301 https://\$host\$request_uri;
+    server_tokens off;
+    # certbot renew (standalone на 127.0.0.1:${ACME_PORT}) — без остановки nginx
+    location ^~ /.well-known/acme-challenge/ {
+        proxy_pass http://127.0.0.1:${ACME_PORT};
+        proxy_set_header Host \$host;
+    }
+    location / { return 301 https://\$host\$request_uri; }
 }
 REDIR
 
@@ -919,9 +1016,11 @@ MAPS
         access_log off;
     }
     # Admin UI (random path). AGH без base-path: proxy_pass со trailing slash
-    # срезает префикс; Location/cookie переписываются; /control/ — API SPA.
+    # срезает префикс; Location/cookie переписываются. SPA обращается к API
+    # относительным путём control/ → /${AGH_PATH}/control/ (корневой /control/ закрыт).
     location ^~ /${AGH_PATH}/ {
         if (\$hack = 1) { return 404; }
+        limit_req zone=panel_rl burst=50 nodelay;
         proxy_pass http://127.0.0.1:${AGH_WEB_PORT}/;
         proxy_redirect http://\$host/    /${AGH_PATH}/;
         proxy_redirect https://\$host/   /${AGH_PATH}/;
@@ -949,26 +1048,12 @@ MAPS
         add_header X-Robots-Tag "noindex, nofollow" always;
     }
     location = /${AGH_PATH} { return 302 /${AGH_PATH}/; }
-    # API AGH (клиентский SPA ходит на /control/* с корня домена)
-    location ^~ /control/ {
-        if (\$hack = 1) { return 404; }
-        proxy_pass http://127.0.0.1:${AGH_WEB_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 300s;
-        proxy_intercept_errors off;
-        add_header X-Robots-Tag "noindex, nofollow" always;
-    }
 AGHLOC
 )
     fi
 
     # ── Главный vhost: TLS termination на 7443, все proxy locations ───────
+    local DOMAIN_RE="${DOMAIN//./\\.}"
     cat > "/etc/nginx/sites-available/${DOMAIN}" <<VHOST
 # ── Rate limiting ──────────────────────────────────────────────────────────
 limit_req_zone  \$binary_remote_addr zone=panel_rl:10m  rate=30r/s;
@@ -985,8 +1070,7 @@ server {
     server_tokens off;
     server_name ${DOMAIN};
     # proxy_protocol: stream :443 передаёт реальный client IP (иначе 127.0.0.1)
-    listen 7443 ssl${http2_listen} proxy_protocol;
-    listen [::]:7443 ssl${http2_listen} proxy_protocol;
+    listen 127.0.0.1:7443 ssl${http2_listen} proxy_protocol;
     ${http2_on}
     # Восстановить \$remote_addr из PROXY protocol (источник — stream loopback)
     set_real_ip_from  127.0.0.1;
@@ -1011,17 +1095,23 @@ server {
     ssl_certificate      /root/cert/${DOMAIN}/fullchain.pem;
     ssl_certificate_key  /root/cert/${DOMAIN}/privkey.pem;
 
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;
 
     # Защита от неправильного хоста / зондирования
-    if (\$host !~* ^(.*\.)?${DOMAIN}\$)             { return 444; }
-    if (\$ssl_server_name !~* ^(.*\.)?${DOMAIN}\$)  { return 444; }
+    if (\$host !~* ^(.*\.)?${DOMAIN_RE}\$)             { return 444; }
+    if (\$ssl_server_name !~* ^(.*\.)?${DOMAIN_RE}\$)  { return 444; }
     if (\$request_uri ~* "(\"|'|\`|~|,|:|;|%|\\\$|&&|\?\?|0x00|0X00|\||\\\\|\{|\}|\[|\]|<|>|\.\.\.|\.\.\/|\/\/\/)") { set \$hack 1; }
     # v10: не маскировать 502/503 панели в 404 (иначе «nginx 404» вместо real upstream error)
     error_page 400 401 402 403 =404 /404;
     proxy_intercept_errors on;
+
+    # ── Ловушки для сканеров (fail2ban jail lucx-nginx-honeypot) ──────────
+    location ~* ^/(\.env|\.git|\.aws|\.ssh|\.DS_Store|wp-login\.php|wp-admin|wp-content|xmlrpc\.php|phpmyadmin|pma|myadmin|boaform|cgi-bin|actuator|vendor/phpunit|HNAP1|owa|autodiscover|solr|manager/html|admin\.php|config\.php|setup\.php|shell|eval-stdin\.php|server-status)(/|\$) {
+        access_log /var/log/nginx/lucx-honeypot.log;
+        return 444;
+    }
 
     # ── LucX-UI Panel ──────────────────────────────────────────────────────
     location ${PANEL_PATH}/ {
@@ -1350,8 +1440,7 @@ VHOST
 server {
     server_tokens off;
     server_name ${REALITY_DOMAIN};
-    listen 9443 ssl${http2_listen};
-    listen [::]:9443 ssl${http2_listen};
+    listen 127.0.0.1:9443 ssl${http2_listen};
     ${http2_on}
     root /var/www/html/;
     index index.html;
@@ -1403,6 +1492,9 @@ configure_db() {
     [[ ! -f "$XUIDB" ]] && die "x-ui.db не найден: ${XUIDB}"
     systemctl stop x-ui 2>/dev/null || true
     sleep 1
+    sqlite3 "$XUIDB" ".backup '${XUIDB}.pre-configure.bak'" 2>/dev/null \
+        && chmod 600 "${XUIDB}.pre-configure.bak" \
+        || warn "Бэкап x-ui.db перед настройкой не создан"
 
     # X25519 ключи для REALITY
     local xray_bin="/usr/local/x-ui/bin/xray-linux-${ARCH}"
@@ -1431,17 +1523,16 @@ configure_db() {
     emoji=$(curl -s --max-time 8 https://ipwho.is/ 2>/dev/null | jq -r '.flag.emoji // "🌐"' 2>/dev/null || echo "🌐")
 
     # Пароль для Trojan / Hysteria2 / mieru / sidecar
-    local trojan_pass hy2_pass mieru_pass
-    trojan_pass=$(rand_str 14)
+    local hy2_pass
     hy2_pass=$(rand_str 20)
-    mieru_pass=$(rand_str 20)
     # Sidecar random credentials (вынесли из SQL heredoc)
     local SC_NAIVE_PASS SC_OLCRTC_KEY SC_OLCRTC_ROOM SC_QWDTT_PASS SC_TG_SECRET SC_TT_PREFIX SC_ANYTLS_PASS
     SC_NAIVE_PASS=$(rand_str 16)
     SC_OLCRTC_KEY=$(rand_hex 16)      # 64 hex (32 байта) — CryptoKey olcRTC
     SC_OLCRTC_ROOM=$(rand_hex 6)      # комната jitsi (требует сигналинг с токеном)
     SC_QWDTT_PASS=$(rand_str 20)
-    SC_TG_SECRET=$(rand_hex 16)
+    # MTProto FakeTLS: "ee" + 16 случайных байт (hex) + hex(fakeTlsDomain)
+    SC_TG_SECRET="ee$(rand_hex 16)$(printf '%s' "$DOMAIN" | od -An -tx1 | tr -d ' \n')"
     SC_TT_PREFIX="$(rand_hex 4)/ffffffff"   # TLS Client Random prefix/mask для TT
     SC_ANYTLS_PASS=$(rand_str 16)
 
@@ -1509,7 +1600,7 @@ INSERT INTO "settings" ("key","value") VALUES
     ("subEncrypt",       'true'),
     ("subShowInfo",      'true'),
     -- NEW v4: подписки json / clash с автоопределением клиента по User-Agent
-    ("subListen",        ''),
+    ("subListen",        '127.0.0.1'),
     ("subJsonEnable",    'true'),
     ("subJsonAutoDetect",        'true'),
     ("subJsonUserAgentRegex",    '(?i)(v2rayn|v2rayng|sing-box|hiddify|nekoray|neko|throne|streisand|karing|exclave)'),
@@ -1525,7 +1616,7 @@ INSERT INTO "settings" ("key","value") VALUES
     ("subClashEnableRouting", 'true'),
     ("subCertFile",      '/root/cert/${DOMAIN}/fullchain.pem'),
     ("subKeyFile",       '/root/cert/${DOMAIN}/privkey.pem'),
-    ("webListen",        ''),
+    ("webListen",        '127.0.0.1'),
     ("webDomain",        ''),
     ("webCertFile",      ''),
     ("webKeyFile",       ''),
@@ -1543,7 +1634,7 @@ INSERT INTO "inbounds"
 VALUES (
   1, 0, 0, 0,
   '${emoji} 🔐 VLESS-REALITY',
-  1, 0, '', 8443, 'vless',
+  1, 0, '127.0.0.1', 8443, 'vless',
   '{"clients":[],"decryption":"none","fallbacks":[]}',
   '{
     "network":"tcp",
@@ -1705,7 +1796,7 @@ VALUES (
   1, 0, '', ${HY2_PORT}, 'hysteria',
   '{
     "version":2,
-    "users":[{"email":"default@hy2","auth":"${hy2_pass}","level":0}]
+    "clients":[{"auth":"${hy2_pass}","email":"default@hy2","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"","comment":"","reset":0}]
   }',
   '{
     "network":"hysteria",
@@ -1869,7 +1960,7 @@ VALUES (
 );
 
 -- ── 13. Telegram MTProto Proxy (встроенный mtg-multi) ───────────────────────
--- LucX-UI использует протокол "mtproto" + settings.users[] с секретами
+-- LucX-UI: протокол "mtproto", settings.clients[] (FakeTLS secret) + fakeTlsDomain
 INSERT INTO "inbounds"
   ("user_id","up","down","total","remark","enable","expiry_time","listen","port",
    "protocol","settings","stream_settings","tag","sniffing")
@@ -1878,7 +1969,8 @@ VALUES (
   '${emoji} ✈️ Telegram MTProto',
   1, 0, '', ${TG_PORT}, 'mtproto',
   '{
-    "users":[{"email":"tg@lucx","secret":"${SC_TG_SECRET}","level":0}]
+    "fakeTlsDomain":"${DOMAIN}",
+    "clients":[{"secret":"${SC_TG_SECRET}","email":"tg@lucx","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"","comment":"","reset":0}]
   }',
   '{
     "network":"tcp",
@@ -2129,7 +2221,7 @@ INSERT INTO "inbounds"
 VALUES (
   1, 0, 0, 0,
   '${emoji} ✈️ Telegram WEB proxy',
-  1, 0, '', ${TPROXY_PORT}, 'tproxy',
+  1, 0, '127.0.0.1', ${TPROXY_PORT}, 'tproxy',
   '{
     "remark":"Telegram WEB proxy",
     "hostname":"${TG_WEB_DOMAIN}",
@@ -2287,8 +2379,8 @@ PYKP
         _subnet="${AWG_SUBNETS[$_i]}"
         _hpk=""
         [[ "$_ver" == "3.1" ]] && _hpk="$HPK31"
-        _Ps=($(awg_keypair)) || die "AWG$((_i+1)): server keypair failed"
-        _Pc=($(awg_keypair)) || die "AWG$((_i+1)): client keypair failed"
+        mapfile -t _Ps < <(awg_keypair)
+        mapfile -t _Pc < <(awg_keypair)
         [[ ${#_Ps[@]} -eq 2 && ${#_Pc[@]} -eq 2 ]] || die "AWG$((_i+1)): invalid keypair"
         _S=$(awg_setting "$_port" "$_ver" "$_subnet" "${_Ps[0]}" "${_Ps[1]}" "${_Pc[0]}" "${_Pc[1]}" "" "" "$_hpk")
         _tag="inbound-awg-v$((_i+1))-${_port}"
@@ -2366,11 +2458,14 @@ SQL
         -username  "$PANEL_USER" \
         -password  "$PANEL_PASS" \
         -port      "$PANEL_PORT" \
-        -webBasePath "${PANEL_PATH}"
+        -webBasePath "${PANEL_PATH}" \
+        -listenIP  127.0.0.1 >/dev/null 2>&1 || warn "x-ui setting завершился с ошибкой"
 
     /usr/local/x-ui/x-ui cert \
         -webCert    "/root/cert/${DOMAIN}/fullchain.pem" \
-        -webCertKey "/root/cert/${DOMAIN}/privkey.pem"
+        -webCertKey "/root/cert/${DOMAIN}/privkey.pem" >/dev/null 2>&1 || warn "x-ui cert завершился с ошибкой"
+    # Перенос clients[] из settings в таблицы clients/client_inbounds
+    /usr/local/x-ui/x-ui migrate >/dev/null 2>&1 || warn "x-ui migrate завершился с ошибкой"
 
     systemctl start x-ui
     sleep 5
@@ -3278,13 +3373,17 @@ configure_db
 # ОПТИМИЗАЦИЯ СИСТЕМЫ (BBR + QUIC)
 ###############################################################################
 tune_system() {
-    inf "Часовой пояс Asia/Yekaterinburg..."
-    if command -v timedatectl >/dev/null 2>&1; then
-        timedatectl set-timezone Asia/Yekaterinburg 2>/dev/null || true
+    if [[ -n "$TIMEZONE" ]]; then
+        inf "Часовой пояс ${TIMEZONE}..."
+        if command -v timedatectl >/dev/null 2>&1; then
+            timedatectl set-timezone "$TIMEZONE" 2>/dev/null || true
+        fi
+        ln -sfn "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime 2>/dev/null || true
+        echo "$TIMEZONE" > /etc/timezone 2>/dev/null || true
+        ok "Timezone: ${TIMEZONE}"
+    else
+        inf "TIMEZONE не задан — часовой пояс системы не меняю"
     fi
-    ln -sfn /usr/share/zoneinfo/Asia/Yekaterinburg /etc/localtime 2>/dev/null || true
-    echo "Asia/Yekaterinburg" > /etc/timezone 2>/dev/null || true
-    ok "Timezone: Asia/Yekaterinburg"
     inf "Оптимизация сетевого стека (BBR, QUIC)..."
     local params=(
         "net.core.default_qdisc=fq"
@@ -3307,7 +3406,7 @@ tune_system() {
     for p in "${params[@]}"; do
         grep -qxF "$p" /etc/sysctl.conf 2>/dev/null || echo "$p" >> /etc/sysctl.conf
     done
-    sysctl -p &>/dev/null
+    sysctl -p >/dev/null 2>&1 || warn "sysctl -p: часть параметров не применена"
     ok "Система оптимизирована"
 }
 tune_system
@@ -3336,52 +3435,164 @@ HTML
     fi
     chown -R www-data:www-data /var/www/html 2>/dev/null || true
 
-    # Cron
-    crontab -l 2>/dev/null | grep -v "certbot\|x-ui" | crontab - 2>/dev/null || true
-    (crontab -l 2>/dev/null
-     echo "@daily   x-ui restart > /dev/null 2>&1 && systemctl reload nginx > /dev/null 2>&1"
-     echo "@monthly certbot renew --non-interactive --pre-hook 'systemctl stop nginx' --post-hook 'systemctl start nginx' > /dev/null 2>&1"
-    ) | crontab -
+    # Cron: v10 перезапускал панель ежедневно и останавливал nginx на время
+    # certbot renew — убираем; продление делает certbot.timer (см. setup_cert_renewal)
+    if crontab -l >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -vE 'x-ui restart|certbot renew' | crontab - 2>/dev/null || true
+    fi
+    setup_cert_renewal
 
-    # Firewall: 22 SSH, 80 HTTP, 443 TCP (nginx), 443 UDP (Hysteria2 QUIC),
-    # а также рандомные порты прямых протоколов
-    ufw disable 2>/dev/null || true
-    ufw allow 22/tcp comment "SSH"
-    ufw allow 80/tcp  comment "HTTP"
-    ufw allow 443/tcp comment "HTTPS"
-    ufw allow 443/udp comment "QUIC/Hysteria2"
-    ufw allow "${HY2_PORT}/udp"    comment "Hysteria2"
-    ufw allow "${QWDTT_PORT}/udp"  comment "qWDTT"
-    ufw allow "${OLCRTC_PORT}/tcp" comment "olcRTC"
-    ufw allow "${MIERU_PORT}/tcp"  comment "mieru"
-    ufw allow "${TRUSTTUNNEL_PORT}/tcp" comment "TrustTunnel"
-    ufw allow "${TG_PORT}/tcp"     comment "Telegram MTProto"
-    ufw allow "${ANYTLS_PORT}/tcp"          comment "AnyTLS"
-    # NEW v4: прямые порты (REALITY-транспорты без SNI-домена, NaiveProxy)
-    ufw allow "${VLESS_XHTTP_R_PORT}/tcp"  comment "VLESS XHTTP REALITY"
-    ufw allow "${VLESS_GRPC_R_PORT}/tcp"   comment "VLESS gRPC REALITY"
-    ufw allow "${NAIVE_PORT}/tcp"          comment "NaiveProxy"
-    # NEW v7.2: AWG UDP-порты + форвардинг туннельных подсетей
-    for _p in "$AWG1_PORT" "$AWG2_PORT" "$AWG3_PORT" "$AWG4_PORT" "$AWG5_PORT" \
-              "$AWG6_PORT" "$AWG7_PORT" "$AWG8_PORT" "$AWG9_PORT"; do
-        ufw allow "${_p}/udp" comment "AWG kernel"
+    setup_firewall
+}
+
+# Порты sshd: env SSH_PORTS → слушающий sshd → sshd -T → 22
+detect_ssh_ports() {
+    local ports
+    ports=$(ss -Hltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}' | sort -un | tr '\n' ' ')
+    [[ -z "${ports// /}" ]] && ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un | tr '\n' ' ')
+    [[ -z "${ports// /}" ]] && ports="22"
+    echo "$ports"
+}
+
+# Удалить правила UFW, созданные этим установщиком (v10 и v11), не трогая чужие
+ufw_purge_managed() {
+    local line rule
+    while IFS= read -r line; do
+        [[ "$line" =~ ^ufw\ (.+)\ comment\ \'(lucx:.*|SSH|HTTP|HTTPS|QUIC/Hysteria2|Hysteria2|qWDTT|olcRTC|mieru|TrustTunnel|Telegram\ MTProto|AnyTLS|VLESS\ XHTTP\ REALITY|VLESS\ gRPC\ REALITY|NaiveProxy|AWG\ kernel|AmneziaWG\ native|AdGuard\ Home\ DoT|AWG\ fwd)\'$ ]] || continue
+        rule="${BASH_REMATCH[1]}"
+        # shellcheck disable=SC2086
+        if [[ "$rule" == route\ * ]]; then
+            ufw route delete ${rule#route } >/dev/null 2>&1 || true
+        else
+            ufw delete ${rule} >/dev/null 2>&1 || true
+        fi
+    done < <(ufw show added 2>/dev/null)
+}
+
+setup_firewall() {
+    inf "Firewall (UFW)..."
+    local p wan_if
+    SSH_PORTS_EFFECTIVE="${SSH_PORTS:-$(detect_ssh_ports)}"
+    inf "  SSH-порт(ы): ${SSH_PORTS_EFFECTIVE}"
+    wan_if=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+
+    ufw disable >/dev/null 2>&1 || true
+    ufw_purge_managed
+    ufw default deny incoming  >/dev/null
+    ufw default allow outgoing >/dev/null
+    # Форвардинг закрыт по умолчанию; разрешаем только из AWG-подсетей (ниже)
+    ufw default deny routed    >/dev/null
+
+    for p in $SSH_PORTS_EFFECTIVE; do
+        ufw limit "${p}/tcp" comment "lucx: SSH" >/dev/null
     done
-    ufw allow "${AMNEZIAWG_PORT}/udp" comment "AmneziaWG native"
-    # NEW v7.3: DoT (DNS-over-TLS) AdGuard Home
-    ufw allow 853/tcp comment "AdGuard Home DoT" 2>/dev/null || ufw allow 853/tcp
-    # v7.3 FIX: синтаксис `ufw route allow in from X` без `on <iface>` —
-    # "Invalid interface clause" (см. lucx-ui-install.log:227-229).
-    # Корректно: `ufw route allow from <net>` (+ .0/24, а не .1/24).
-    for _s in "$AWG1_SUBNET" "$AWG2_SUBNET" "$AWG3_SUBNET" "$AWG4_SUBNET" "$AWG5_SUBNET" \
+    ufw allow 80/tcp  comment "lucx: HTTP (ACME, redirect)" >/dev/null
+    ufw allow 443/tcp comment "lucx: HTTPS SNI" >/dev/null
+    ufw allow "${HY2_PORT}/udp" comment "lucx: Hysteria2" >/dev/null
+    # Прямые порты sidecar-протоколов (у них нет маршрута через 443)
+    ufw allow "${NAIVE_PORT}/tcp"  comment "lucx: NaiveProxy" >/dev/null
+    ufw allow "${OLCRTC_PORT}/tcp" comment "lucx: olcRTC" >/dev/null
+    ufw allow "${QWDTT_PORT}/udp"  comment "lucx: qWDTT" >/dev/null
+    ufw allow "${MIERU_PORT}/tcp"  comment "lucx: mieru" >/dev/null
+    ufw allow "${ANYTLS_PORT}/tcp" comment "lucx: AnyTLS" >/dev/null
+    ufw allow "${TG_PORT}/tcp"     comment "lucx: Telegram MTProto" >/dev/null
+    # С SNI-доменом эти протоколы идут через 443 (nginx stream → 127.0.0.1)
+    [[ -z "$TT_DOMAIN" ]]      && ufw allow "${TRUSTTUNNEL_PORT}/tcp"   comment "lucx: TrustTunnel" >/dev/null
+    [[ -z "$XHTTP_R_DOMAIN" ]] && ufw allow "${VLESS_XHTTP_R_PORT}/tcp" comment "lucx: VLESS XHTTP REALITY" >/dev/null
+    [[ -z "$GRPC_R_DOMAIN" ]]  && ufw allow "${VLESS_GRPC_R_PORT}/tcp"  comment "lucx: VLESS gRPC REALITY" >/dev/null
+    for p in "$AWG1_PORT" "$AWG2_PORT" "$AWG3_PORT" "$AWG4_PORT" "$AWG5_PORT" \
+             "$AWG6_PORT" "$AWG7_PORT" "$AWG8_PORT" "$AWG9_PORT" "$AMNEZIAWG_PORT"; do
+        ufw allow "${p}/udp" comment "lucx: AWG" >/dev/null
+    done
+    [[ "$INSTALL_ADGUARD" != "0" ]] && ufw allow 853/tcp comment "lucx: DoT" >/dev/null
+
+    local s_
+    for s_ in "$AWG1_SUBNET" "$AWG2_SUBNET" "$AWG3_SUBNET" "$AWG4_SUBNET" "$AWG5_SUBNET" \
               "$AWG6_SUBNET" "$AWG7_SUBNET" "$AWG8_SUBNET" "$AWG9_SUBNET" "$AMNEZIAWG_SUBNET"; do
-        ufw route allow from "${_s%.*}.0/24" comment "AWG fwd" 2>/dev/null || \
-        ufw route allow from "${_s%.*}.0/24" 2>/dev/null || true
+        if [[ -n "$wan_if" ]]; then
+            ufw route allow out on "$wan_if" from "${s_%.*}.0/24" comment "lucx: AWG fwd" >/dev/null
+        else
+            ufw route allow from "${s_%.*}.0/24" comment "lucx: AWG fwd" >/dev/null
+        fi
     done
-    # v7.3: разрешаем форвардинг для VPN-трафика (иначе DEFAULT_FORWARD_POLICY=DROP режет AWG)
-    ufw default allow routed 2>/dev/null || true
-    ufw --force enable
+
+    # NAT пишется в before.rules ДО включения UFW, иначе применится только после reload
     setup_awg_network
-    ok "Firewall настроен"
+    ufw --force enable >/dev/null || die "ufw enable завершился с ошибкой"
+    ok "Firewall настроен (SSH: ${SSH_PORTS_EFFECTIVE}; routed: deny, кроме AWG)"
+}
+
+# Продление сертификатов: certbot.timer + standalone на loopback-порту,
+# nginx :80 проксирует /.well-known/acme-challenge/ — nginx не останавливается
+setup_cert_renewal() {
+    local d conf
+    for d in "${CERT_DOMAINS[@]}"; do
+        conf="/etc/letsencrypt/renewal/${d}.conf"
+        [[ -f "$conf" ]] || continue
+        sed -i -E '/^(http01_port|pre_hook|post_hook|renew_hook) *=/d' "$conf"
+        sed -i "/^\[renewalparams\]/a http01_port = ${ACME_PORT}" "$conf"
+    done
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/lucx-reload.sh <<'HOOK'
+#!/bin/sh
+# Новый сертификат: nginx перечитывает конфиг, панель — TLS sidecar/подписок
+nginx -t && systemctl reload nginx
+systemctl restart x-ui
+HOOK
+    chmod 755 /etc/letsencrypt/renewal-hooks/deploy/lucx-reload.sh
+    systemctl enable --now certbot.timer >/dev/null 2>&1 || \
+        warn "certbot.timer не включён — продление: certbot renew (проверка: certbot renew --dry-run)"
+    ok "Продление сертификатов: certbot.timer, ACME через nginx → 127.0.0.1:${ACME_PORT}"
+}
+
+# fail2ban: sshd + ловушки nginx (сканеры .env/wp-login/phpmyadmin/...)
+setup_fail2ban() {
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        warn "fail2ban не установлен — пропуск"
+        return 0
+    fi
+    inf "fail2ban (sshd + nginx honeypot)..."
+    local ignore="127.0.0.1/8 ::1" admin_ip="${SSH_CLIENT:-}"; admin_ip="${admin_ip%% *}"
+    [[ "$admin_ip" =~ ^[0-9a-fA-F:.]+$ ]] && ignore+=" ${admin_ip}"
+    mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
+    touch /var/log/nginx/lucx-honeypot.log
+    cat > /etc/fail2ban/filter.d/lucx-nginx-honeypot.conf <<'FLT'
+[Definition]
+# fail2ban вырезает дату ([...]) до сопоставления — в regex её нет
+failregex = ^<HOST> - \S+ .*"[^"]*" \d{3} 
+ignoreregex =
+FLT
+    cat > /etc/fail2ban/jail.d/lucx.conf <<JAIL
+[DEFAULT]
+banaction = ufw
+banaction_allports = ufw
+ignoreip = ${ignore}
+
+[sshd]
+enabled  = true
+port     = $(printf '%s' "$SSH_PORTS_EFFECTIVE" | xargs | tr ' ' ',')
+backend  = systemd
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+
+[lucx-nginx-honeypot]
+enabled  = true
+port     = http,https
+filter   = lucx-nginx-honeypot
+logpath  = /var/log/nginx/lucx-honeypot.log
+backend  = auto
+maxretry = 2
+findtime = 1h
+bantime  = 1d
+JAIL
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        warn "fail2ban: конфиг не прошёл проверку (fail2ban-client -t) — jail lucx отключён"
+        rm -f /etc/fail2ban/jail.d/lucx.conf
+    fi
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl restart fail2ban 2>/dev/null || warn "fail2ban не перезапустился — journalctl -u fail2ban"
+    ok "fail2ban: sshd + lucx-nginx-honeypot"
 }
 
 # NEW v7.2: ip_forward + MASQUERADE для AWG-подсетей (NAT для VPN-протоколов)
@@ -3395,6 +3606,16 @@ setup_awg_network() {
     wan_if=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     [[ -z "$wan_if" ]] && { warn "WAN-интерфейс не определён — MASQUERADE не добавлен"; return 0; }
 
+    # Блок NAT пересоздаётся при каждом запуске (подсети/WAN могли измениться)
+    if grep -q 'AWG MASQUERADE' /etc/ufw/before.rules 2>/dev/null; then
+        python3 - /etc/ufw/before.rules <<'PYNAT'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+t = re.sub(r"\n?\*nat\n:POSTROUTING ACCEPT \[0:0\]\n# AWG MASQUERADE \(managed by lucx installer\)\n(?:-A POSTROUTING[^\n]*\n)*COMMIT\n", "\n", t)
+open(p, "w").write(t)
+PYNAT
+    fi
     if ! grep -q 'AWG MASQUERADE' /etc/ufw/before.rules 2>/dev/null; then
         # v7.3 FIX: в -s нужен адрес сети .0/24, а не .1/24 (host bits set).
         cat >> /etc/ufw/before.rules <<NAT
@@ -3421,9 +3642,10 @@ NAT
         iptables -t nat -C POSTROUTING -s "$net" -o "$wan_if" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s "$net" -o "$wan_if" -j MASQUERADE
     done
-    ok "AWG: ip_forward + MASQUERADE (${AWG15_SUBNET} → ${wan_if}) готовы"
+    ok "AWG: ip_forward + MASQUERADE (AWG-подсети → ${wan_if}) готовы"
 }
 setup_misc
+setup_fail2ban
 
 ###############################################################################
 # CLASH / MIHOMO: глобальный шаблон маршрутизации (RU + adblock + url-test)
@@ -3449,187 +3671,14 @@ install_clash_routing_template
 # Также: mieru traffic-pattern, AnyTLS public endpoint, TrustTunnel HTTPS-only.
 ###############################################################################
 setup_sub_sidecar() {
-    # v10.1: sub-sidecar патч ломал встроенную выдачу подписок — отключён.
-    inf "Sub-sidecar пропущен (встроенная подписка панели на SUB_PORT)"
-    return 0
-    local __disabled_sub_sidecar=1
-
-    inf "Установка LucX subscription sidecar (совместимость Throne/AWG)..."
-    local SIDECAR_DIR="/opt/lucx-sub-sidecar"
-    local SIDECAR_PY="${SIDECAR_DIR}/lucx_sub_sidecar.py"
-    local SIDECAR_URL="https://raw.githubusercontent.com/534188-create/x-tuna/main/src/lucx_post_configurator/assets/lucx_sub_sidecar.py"
-    local CERT_DIR="/etc/lucx-sub-sidecar"
-
-    mkdir -p "$SIDECAR_DIR" "$CERT_DIR"
-    if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 90 \
-            -o "$SIDECAR_PY" "$SIDECAR_URL"; then
-        warn "  Не удалось скачать lucx_sub_sidecar.py — подписка напрямую в панель"
-        warn "  (AWG в Throne: возможны сбои delay/ping без wg:// конвертации)"
-        # откат nginx → панель (только строки sub-sidecar)
-        sed -i "s|proxy_pass https://127.0.0.1:${SIDECAR_PORT};.*|proxy_pass https://127.0.0.1:${SUB_PORT};|" \
-            "/etc/nginx/sites-available/${DOMAIN}" 2>/dev/null || true
-        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
-        return 0
+    # v10.1: sidecar ломал встроенную выдачу подписок — не используется;
+    # убираем остатки старых установок.
+    if [[ -f /etc/systemd/system/lucx-sub-sidecar.service ]]; then
+        systemctl disable --now lucx-sub-sidecar 2>/dev/null || true
+        rm -f /etc/systemd/system/lucx-sub-sidecar.service
+        systemctl daemon-reload
     fi
-    chmod 755 "$SIDECAR_PY"
-    command -v python3 >/dev/null || die "python3 не найден (нужен для sub-sidecar)"
-
-    # Патч: панель публикует TrustTunnel дважды (tt://?TLV + tt://user@host).
-    # _dedupe_lines сравнивал строки точно → оба оставались. Схлопываем по host/port/secret.
-    python3 - "$SIDECAR_PY" <<'PATCH'
-import pathlib, re, sys
-path = pathlib.Path(sys.argv[1])
-src = path.read_text(encoding="utf-8")
-needle = "def _dedupe_lines(lines: list[str]) -> list[str]:"
-if needle not in src:
-    print("dedupe_fn_missing", file=sys.stderr)
-    sys.exit(0)
-# Replace from def _dedupe_lines through end of function (next def at same indent)
-start = src.index(needle)
-# find next\ndef at column 0 after start
-m = re.search(r"\ndef ", src[start + 1 :])
-if not m:
-    print("dedupe_end_missing", file=sys.stderr)
-    sys.exit(0)
-end = start + 1 + m.start()
-replacement = '''def _dedupe_lines(lines: list[str]) -> list[str]:
-    """Drop exact duplicates and TrustTunnel dual-format pairs (TLV + HTTPS URI).
-
-    LucX emits both ``tt://?<TLV>`` and ``tt://user:pass@host:443?...`` for the
-    same inbound. Exact-string dedupe keeps both; clients then show two
-    TrustTunnel profiles. Prefer the HTTPS URI form; fall back to TLV.
-    """
-
-    def _tt_identity(line: str) -> str | None:
-        s = line.strip()
-        low = s.lower()
-        if not low.startswith("tt://"):
-            return None
-        if low.startswith("tt://?"):
-            link = decode_trusttunnel_deeplink(s)
-            if not link:
-                return "tt-tlv-unparsed:" + s[:48]
-            host = str(
-                link.get("hostname") or link.get("host") or link.get("sni") or ""
-            ).lower().rstrip(".")
-            port = 443
-            addr = str(link.get("address") or "")
-            if ":" in addr:
-                try:
-                    port = int(addr.rsplit(":", 1)[-1])
-                except ValueError:
-                    port = 443
-            elif link.get("port") is not None:
-                try:
-                    port = int(link.get("port"))
-                except (TypeError, ValueError):
-                    port = 443
-            # identity by host+port+user (password differs in encoding edge cases)
-            user = str(link.get("user") or link.get("password") or link.get("secret") or "")
-            return f"tt|{host}|{port}|{user}"
-        # tt://user:pass@host:port?...
-        try:
-            rest = s[5:]  # after tt://
-            if "#" in rest:
-                rest = rest.split("#", 1)[0]
-            auth_host = rest.split("?", 1)[0]
-            if "@" not in auth_host:
-                return "tt-raw:" + auth_host.lower()
-            userinfo, hostport = auth_host.rsplit("@", 1)
-            user = userinfo.split(":", 1)[0]
-            if ":" in hostport:
-                host, port_s = hostport.rsplit(":", 1)
-                port = int(port_s) if port_s.isdigit() else 443
-            else:
-                host, port = hostport, 443
-            return f"tt|{host.lower().rstrip('.')}|{port}|{user}"
-        except (TypeError, ValueError, IndexError):
-            return "tt-fallback:" + s[:64]
-
-    seen_exact: set[str] = set()
-    seen_tt: dict[str, int] = {}  # identity -> index in result
-    result: list[str] = []
-    for item in lines:
-        key = item.strip()
-        if not key:
-            result.append(item)
-            continue
-        if key in seen_exact:
-            continue
-        tt_id = _tt_identity(key)
-        if tt_id is not None:
-            low = key.lower()
-            is_https = low.startswith("tt://") and not low.startswith("tt://?")
-            if tt_id in seen_tt:
-                prev_i = seen_tt[tt_id]
-                prev = result[prev_i].strip()
-                prev_https = prev.lower().startswith("tt://") and not prev.lower().startswith("tt://?")
-                # Prefer HTTPS URI over TLV deep link
-                if is_https and not prev_https:
-                    result[prev_i] = item
-                    seen_exact.discard(prev)
-                    seen_exact.add(key)
-                continue
-            seen_tt[tt_id] = len(result)
-            seen_exact.add(key)
-            result.append(item)
-            continue
-        seen_exact.add(key)
-        result.append(item)
-    return result
-
-
-'''
-path.write_text(src[:start] + replacement + src[end:], encoding="utf-8")
-print("tt_dedupe_patched")
-PATCH
-
-    # TLS: sidecar требует fullchain+privkey (validate_startup)
-    ln -sfn "/root/cert/${DOMAIN}/fullchain.pem" "${CERT_DIR}/fullchain.pem"
-    ln -sfn "/root/cert/${DOMAIN}/privkey.pem"   "${CERT_DIR}/privkey.pem"
-    [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]] || \
-        die "Нет сертификатов для sub-sidecar (${CERT_DIR})"
-
-    cat > /etc/systemd/system/lucx-sub-sidecar.service <<UNIT
-[Unit]
-Description=LucX subscription compatibility sidecar (Throne AWG wg:// rewrite)
-After=network.target x-ui.service
-Wants=x-ui.service
-
-[Service]
-Type=simple
-Environment=SIDECAR_LISTEN_HOST=127.0.0.1
-Environment=SIDECAR_LISTEN_PORT=${SIDECAR_PORT}
-Environment=XUI_SUB_HOST=127.0.0.1
-Environment=XUI_SUB_PORT=${SUB_PORT}
-Environment=XUI_SUB_SCHEME=https
-Environment=XUI_SUB_TLS_VERIFY=false
-Environment=XUI_AWG_PATH=${AWG_PATH}/
-Environment=XUI_DB=/etc/x-ui/x-ui.db
-Environment=SIDECAR_ALLOWED_HOSTS=${DOMAIN}
-Environment=SIDECAR_ALLOWED_PATH_PREFIXES=${SUB_PATH}/,${CLASH_PATH}/,${JSON_PATH}/,${AWG_PATH}/
-Environment=SIDECAR_CERT=${CERT_DIR}/fullchain.pem
-Environment=SIDECAR_KEY=${CERT_DIR}/privkey.pem
-ExecStart=/usr/bin/python3 ${SIDECAR_PY}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable lucx-sub-sidecar
-    systemctl restart lucx-sub-sidecar
-    sleep 1
-    if systemctl is-active --quiet lucx-sub-sidecar; then
-        ok "  lucx-sub-sidecar на 127.0.0.1:${SIDECAR_PORT} (TLS)"
-    else
-        warn "  lucx-sub-sidecar не стартовал — journalctl -u lucx-sub-sidecar"
-        journalctl -u lucx-sub-sidecar -n 25 --no-pager >&2 || true
-    fi
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
-    ok "Sub-sidecar: AWG amneziawg://→wg:// (Throne), path ${AWG_PATH}/"
+    inf "Sub-sidecar не используется (встроенная подписка панели на SUB_PORT)"
 }
 setup_sub_sidecar
 
@@ -3642,7 +3691,9 @@ setup_sub_sidecar
 setup_adguard() {
     if [[ "$INSTALL_ADGUARD" == "0" ]]; then
         inf "AdGuard Home пропущен (INSTALL_ADGUARD=0)"
-        rm -f /etc/nginx/stream-enabled/dot-853.conf 2>/dev/null || true
+        rm -f /etc/nginx/stream-enabled/dot-853.conf \
+              /etc/systemd/system/nginx.service.d/after-adguard.conf 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
         return 0
     fi
     inf "Установка AdGuard Home (DoH + админка за nginx)..."
@@ -3651,31 +3702,51 @@ setup_adguard() {
     local AGH_YAML="${AGH_DIR}/AdGuardHome.yaml"
 
     # Пакеты (htpasswd для bcrypt-хэша пароля)
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar ca-certificates apache2-utils 2>/dev/null || true
+    command -v htpasswd >/dev/null 2>&1 || \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils >/dev/null 2>&1 || \
+        die "Не удалось установить apache2-utils (htpasswd)"
 
     # ── Бинарник ────────────────────────────────────────────────────────────
     local agh_arch
-    case "$(uname -m)" in
-        x86_64)  agh_arch="amd64" ;;
-        aarch64) agh_arch="arm64" ;;
-        armv7l)  agh_arch="armv7" ;;
-        *) die "AdGuard Home: неподдерживаемая архитектура: $(uname -m)" ;;
+    case "$ARCH" in
+        amd64|arm64|armv7|386) agh_arch="$ARCH" ;;
+        *) die "AdGuard Home: неподдерживаемая архитектура: ${ARCH}" ;;
     esac
-    if [[ -x "${AGH_DIR}/AdGuardHome" ]]; then
-        ok "  Бинарник AdGuard Home уже есть — сохраняю"
+    local agh_ver="$AGH_VERSION" agh_cur=""
+    if [[ "$agh_ver" == "latest" ]]; then
+        agh_ver=$(gh_latest_tag AdguardTeam/AdGuardHome) || agh_ver=""
+    fi
+    [[ -n "$agh_ver" ]] || die "Не удалось определить версию AdGuard Home"
+    [[ -x "${AGH_DIR}/AdGuardHome" ]] && \
+        agh_cur=$("${AGH_DIR}/AdGuardHome" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    if [[ "$agh_cur" == "$agh_ver" ]]; then
+        ok "  AdGuard Home ${agh_ver} уже установлен"
     else
-        curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 \
-            "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
-            | tar -xz -C /opt \
-            || die "Не удалось скачать AdGuard Home"
-        [[ -x "${AGH_DIR}/AdGuardHome" ]] || die "AdGuardHome binary отсутствует после распаковки"
+        local agh_asset="AdGuardHome_linux_${agh_arch}.tar.gz"
+        local agh_rel="https://github.com/AdguardTeam/AdGuardHome/releases/download/${agh_ver}"
+        local agh_stage agh_sum
+        agh_stage=$(mktemp -d /root/.agh-stage.XXXXXX) || die "mktemp не сработал"
+        inf "  Загрузка AdGuard Home ${agh_ver} (${agh_asset})..."
+        download "${agh_rel}/${agh_asset}" "${agh_stage}/${agh_asset}" || die "Не удалось скачать AdGuard Home ${agh_ver}"
+        download "${agh_rel}/checksums.txt" "${agh_stage}/checksums.txt" || die "Не удалось скачать checksums.txt AdGuard Home"
+        agh_sum=$(awk -v a="$agh_asset" '$2==a || $2=="./"a {print $1; exit}' "${agh_stage}/checksums.txt")
+        verify_sha256 "${agh_stage}/${agh_asset}" "$agh_sum" || die "SHA256 AdGuard Home не совпадает с checksums.txt"
+        tar -xzf "${agh_stage}/${agh_asset}" -C "$agh_stage" || die "Ошибка распаковки AdGuard Home"
+        [[ -x "${agh_stage}/AdGuardHome/AdGuardHome" ]] || die "AdGuardHome binary отсутствует в архиве"
+        systemctl stop AdGuardHome 2>/dev/null || true
+        mkdir -p "$AGH_DIR"
+        install -m 755 "${agh_stage}/AdGuardHome/AdGuardHome" "${AGH_DIR}/AdGuardHome.new" \
+            && mv -f "${AGH_DIR}/AdGuardHome.new" "${AGH_DIR}/AdGuardHome" \
+            || die "Не удалось установить бинарник AdGuard Home"
+        rm -rf "$agh_stage"
+        ok "  AdGuard Home ${agh_ver}: SHA256 совпадает, установлен${agh_cur:+ (было ${agh_cur})}"
     fi
 
     # ── Конфиг: всегда пишем актуальные порты/сертификаты этого запуска ─────
     # (cleanup_old бэкапит старый yaml; повторный запуск без cleanup тоже
     #  перезаписывает порты, иначе nginx смотрит на новые, AGH — на старые)
     local agh_hash
-    agh_hash=$(htpasswd -nbB x "$AGH_PASS" | cut -d: -f2)
+    agh_hash=$(printf '%s\n' "$AGH_PASS" | htpasswd -niB x | cut -d: -f2)
     [[ "$agh_hash" == \$2* ]] || die "bcrypt-хэш не сгенерирован (htpasswd)"
     systemctl stop AdGuardHome 2>/dev/null || true
     # Хэш содержит '$2y$12$...' — quoted-heredoc + плейсхолдеры + sed.
@@ -3759,11 +3830,11 @@ dns:
   cache_optimistic: true
   ratelimit: 0
   refuse_any: true
-# v7.3: TLS нужен для DoT. Web-UI HTTPS у AGH ОТКЛЮЧЁН (port_https: 0) —
-# снаружи TLS терминирует nginx, админка проксируется на plain HTTP
-# 127.0.0.1:__AGH_WEB__ (иначе 502 от мёртвого TLS → error_page → «404 nginx»).
-# DoT — loopback __AGH_DOT__; nginx stream :853 → этот порт.
-# allow_unencrypted_doh=true: DoH /dns-query на plain HTTP для nginx.
+# v11: TLS у AGH выключен полностью. Снаружи TLS терминирует nginx:
+#   DoH  — vhost панели /dns-query → plain HTTP 127.0.0.1:__AGH_WEB__;
+#   DoT  — nginx stream :853 (ssl) → plain DNS/TCP 127.0.0.1:__AGH_DNS__.
+# allow_unencrypted_doh=true: DoH на plain HTTP для nginx. Схема 28 —
+# AGH сам мигрирует её (в новых версиях → http.doh.insecure_enabled).
 tls:
   enabled: false
   server_name: __AGH_DOMAIN__
@@ -3776,7 +3847,7 @@ tls:
   certificate_path: /root/cert/__AGH_DOMAIN__/fullchain.pem
   private_key_path: /root/cert/__AGH_DOMAIN__/privkey.pem
   port_https: 0
-  port_dns_over_tls: __AGH_DOT__
+  port_dns_over_tls: 0
   port_dns_over_quic: 0
   port_quic: 0
 # Фильтры HostlistsRegistry (+ AdAway с прямого URL).
@@ -3852,12 +3923,11 @@ schema_version: 28
 AGHYAML
     sed -i -e "s|__AGH_WEB__|${AGH_WEB_PORT}|" \
            -e "s|__AGH_DNS__|${AGH_DNS_PORT}|" \
-           -e "s|__AGH_DOT__|${AGH_DOT_PORT}|" \
            -e "s|__AGH_USER__|${AGH_USER}|" \
            -e "s|__AGH_HASH__|${agh_hash}|" \
            -e "s|__AGH_DOMAIN__|${DOMAIN}|g" "$AGH_YAML"
     chmod 600 "$AGH_YAML"
-    ok "  AdGuardHome.yaml: web(http) ${AGH_WEB_PORT}, DNS ${AGH_DNS_PORT}, DoT(loopback) ${AGH_DOT_PORT}"
+    ok "  AdGuardHome.yaml: web(http) 127.0.0.1:${AGH_WEB_PORT}, DNS 127.0.0.1:${AGH_DNS_PORT}"
 
     # ── Systemd (после cleanup unit снят; -s install безопасен) ─────────────
     # Если unit всё же остался (SKIP_CLEANUP / ручной остаток) — снимаем и ставим заново.
@@ -3873,8 +3943,8 @@ AGHYAML
     systemctl restart AdGuardHome 2>/dev/null || systemctl start AdGuardHome 2>/dev/null || true
 
     # ── Ожидание запуска (web-UI только HTTP, port_https=0) ────────────────
-    local up=0 i code
-    for i in $(seq 1 30); do
+    local up=0 code
+    for _ in $(seq 1 30); do
         code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-redirs 0 \
             "http://127.0.0.1:${AGH_WEB_PORT}/" 2>/dev/null || echo "000")
         if [[ "$code" =~ ^(200|301|302|303|307|308)$ ]]; then
@@ -3906,27 +3976,34 @@ AGHYAML
         "https://${DOMAIN}/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
         --resolve "${DOMAIN}:443:127.0.0.1" 2>/dev/null || echo "000")
     if [[ "$doh_status" == "200" ]]; then
+        AGH_DOH_OK=1
         ok "  DoH-эндпоинт отвечает (HTTP 200)"
     else
+        AGH_DOH_OK=0
         warn "  DoH self-test: HTTP ${doh_status} — проверьте позже (nginx/AdGuard)"
     fi
 
-    # ── v10: DoT stream :853 только после AGH DoT up ────────────────────────
-    # nginx не должен слушать 853, пока AGH_DOT_PORT не отвечает.
-    local dot_up=0 di
-    for di in $(seq 1 20); do
-        if ss -lnt 2>/dev/null | grep -qE "127\.0\.0\.1:${AGH_DOT_PORT}\\b"; then
-            dot_up=1; break
-        fi
-        # fallback: curl к web UI уже OK — DoT часто поднимается вместе
-        sleep 0.3
-    done
+    # После миграции схемы AGH должен сохранить разрешение plain-HTTP DoH
+    if ! grep -qE '^[[:space:]]*(insecure_enabled|allow_unencrypted_doh):[[:space:]]*true' "$AGH_YAML"; then
+        warn "  AdGuardHome.yaml: не найден insecure_enabled/allow_unencrypted_doh=true — DoH через nginx может не работать"
+    fi
+
+    # ── DoT :853: TLS терминирует nginx (сертификат панели) → plain DNS AGH ──
     cat > /etc/nginx/stream-enabled/dot-853.conf <<DOT853
-# v10: DoT L4 без PP (AGH DoT не разбирает PROXY protocol)
+# DNS-over-TLS: TLS в nginx, дальше DNS/TCP на loopback AdGuard Home
+limit_conn_zone \$binary_remote_addr zone=lucx_dot_conn:10m;
 server {
-    listen     853;
-    listen     [::]:853;
-    proxy_pass 127.0.0.1:${AGH_DOT_PORT};
+    listen     853 ssl;
+    listen     [::]:853 ssl;
+    ssl_certificate      /root/cert/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key  /root/cert/${DOMAIN}/privkey.pem;
+    ssl_protocols        TLSv1.2 TLSv1.3;
+    ssl_session_cache    shared:LUCXDOT:5m;
+    ssl_handshake_timeout 10s;
+    limit_conn           lucx_dot_conn 32;
+    proxy_connect_timeout 5s;
+    proxy_timeout        120s;
+    proxy_pass           127.0.0.1:${AGH_DNS_PORT};
 }
 DOT853
     # systemd: nginx After=AdGuardHome (drop-in)
@@ -3939,12 +4016,30 @@ DROPIN
     systemctl daemon-reload 2>/dev/null || true
     if nginx -t 2>/dev/null; then
         systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-        ok "  DoT :853 → 127.0.0.1:${AGH_DOT_PORT} (nginx stream, After=AdGuardHome)"
+        ok "  DoT :853 (TLS nginx) → 127.0.0.1:${AGH_DNS_PORT}"
     else
-        warn "  nginx -t failed after DoT config — проверьте /etc/nginx/stream-enabled/dot-853.conf"
+        warn "  nginx -t не прошёл с DoT — конфиг /etc/nginx/stream-enabled/dot-853.conf отключён"
+        rm -f /etc/nginx/stream-enabled/dot-853.conf
     fi
-    if [[ $dot_up -ne 1 ]]; then
-        warn "  AGH DoT на :${AGH_DOT_PORT} ещё не слушает — nginx 853 готов, DoT поднимется с AGH"
+
+    # ── Self-test DoT (проверка сертификата + DNS-ответ) ────────────────────
+    sleep 1
+    if python3 - "$DOMAIN" <<'PYDOT' 2>/dev/null; then
+import socket, ssl, struct, sys
+q = b"\x4c\x58\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+ctx = ssl.create_default_context()
+with socket.create_connection(("127.0.0.1", 853), timeout=8) as raw:
+    with ctx.wrap_socket(raw, server_hostname=sys.argv[1]) as t:
+        t.sendall(struct.pack("!H", len(q)) + q)
+        hdr = t.recv(2)
+        resp = t.recv(struct.unpack("!H", hdr)[0])
+sys.exit(0 if resp[:2] == b"\x4c\x58" else 1)
+PYDOT
+        AGH_DOT_OK=1
+        ok "  DoT self-test: OK (tls://${DOMAIN})"
+    else
+        AGH_DOT_OK=0
+        warn "  DoT self-test не прошёл — проверьте: nginx -t; journalctl -u AdGuardHome -n 30"
     fi
 
     ok "AdGuard Home установлен: https://${DOMAIN}/${AGH_PATH}/ (логин ${AGH_USER})"
@@ -4110,7 +4205,6 @@ ADGUARD_USER=${AGH_USER}
 ADGUARD_PASS=${AGH_PASS}
 ADGUARD_DOH_URL=https://${DOMAIN}/dns-query
 ADGUARD_DOT_URL=${DOMAIN}:853
-ADGUARD_WEB_TLS_PORT=${AGH_WEB_TLS_PORT}
 CREDS
     chmod 600 "$cred_file"
     echo ""
@@ -4165,14 +4259,21 @@ RCREDS
     chmod 600 "$root_cred"
     echo -e "  Файл с данными: ${root_cred} (mode 600)"
 }
-print_results
+# Учётные данные — только в терминал (fd 3) и в файлы 600, не в лог установки
+sleep 1
+print_results >&3 2>&1
+echo "[OK] Итоговый отчёт с учётными данными: /root/lucx-ui-credentials.txt (chmod 600)"
 
 ###############################################################################
 # ФИНАЛЬНЫЙ РЕСТАРТ
 ###############################################################################
 systemctl daemon-reload
 systemctl restart x-ui 2>/dev/null || warn "x-ui restart failed — проверьте: systemctl status x-ui"
-systemctl reload nginx 2>/dev/null  || warn "nginx reload failed — проверьте: nginx -t"
+if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || warn "nginx reload failed — systemctl status nginx"
+else
+    warn "nginx -t не прошёл — reload пропущен (см. nginx -t)"
+fi
 
 ###############################################################################
 # СТАТУС И ДИАГНОСТИКА (по мотивам x-tuna / lucx-post-configure)
@@ -4180,7 +4281,7 @@ systemctl reload nginx 2>/dev/null  || warn "nginx reload failed — прове�
 status_and_diagnostics() {
     echo ""
     echo -e "${BLUE}═══════════════════  СТАТУС И ДИАГНОСТИКА  ══════════════════════════${NC}"
-    local svc okc=0 failc=0
+    local svc okc=0 failc=0 degc=0
     for svc in x-ui nginx; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             echo -e "  ${GREEN}●${NC} ${svc}: active"
@@ -4218,14 +4319,17 @@ status_and_diagnostics() {
         ((failc++)) || true
     fi
 
-    # Listening sockets (panel/sub on loopback, 443 public)
-    local listen_ok=1
+    # Listening sockets (panel/sub on loopback, 443 public); панели после restart нужно время
+    for _ in $(seq 1 30); do
+        ss -Hltn "sport = :${PANEL_PORT}" 2>/dev/null | grep -q . && break
+        sleep 1
+    done
     if ss -lnt 2>/dev/null | grep -qE ":${PANEL_PORT}\b"; then
         echo -e "  ${GREEN}●${NC} panel listen :${PANEL_PORT}"
         ((okc++)) || true
     else
-        echo -e "  ${YELLOW}●${NC} panel :${PANEL_PORT} not listening yet"
-        listen_ok=0
+        echo -e "  ${RED}●${NC} panel :${PANEL_PORT} не слушает"
+        ((failc++)) || true
     fi
     if ss -lnt 2>/dev/null | grep -qE ":443\b"; then
         echo -e "  ${GREEN}●${NC} nginx/stream :443"
@@ -4251,6 +4355,40 @@ status_and_diagnostics() {
         ((okc++)) || true
     fi
 
+    # Внутренние сервисы не должны слушать публичные адреса
+    local lp laddr
+    for lp in "$PANEL_PORT" "$SUB_PORT" 7443 9443 8443 "$AGH_WEB_PORT" "$AGH_DNS_PORT"; do
+        laddr=$(ss -Hltn "sport = :${lp}" 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' | head -n1)
+        if [[ -n "$laddr" ]]; then
+            echo -e "  ${YELLOW}●${NC} :${lp} слушает ${laddr} (ожидался только 127.0.0.1; закрыт UFW)"
+            ((degc++)) || true
+        fi
+    done
+
+    # Firewall / fail2ban
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+        echo -e "  ${GREEN}●${NC} ufw: active"
+        ((okc++)) || true
+    else
+        echo -e "  ${RED}●${NC} ufw: inactive"
+        ((failc++)) || true
+    fi
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo -e "  ${GREEN}●${NC} fail2ban: active ($(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p'))"
+        ((okc++)) || true
+    else
+        echo -e "  ${YELLOW}●${NC} fail2ban: inactive"
+        ((degc++)) || true
+    fi
+
+    # DoH / DoT (результаты self-test из setup_adguard)
+    if [[ "${INSTALL_ADGUARD:-1}" != "0" ]]; then
+        if [[ "${AGH_DOH_OK:-0}" == 1 ]]; then echo -e "  ${GREEN}●${NC} DoH https://${DOMAIN}/dns-query"; ((okc++)) || true
+        else echo -e "  ${YELLOW}●${NC} DoH self-test не прошёл"; ((degc++)) || true; fi
+        if [[ "${AGH_DOT_OK:-0}" == 1 ]]; then echo -e "  ${GREEN}●${NC} DoT tls://${DOMAIN}:853"; ((okc++)) || true
+        else echo -e "  ${YELLOW}●${NC} DoT self-test не прошёл"; ((degc++)) || true; fi
+    fi
+
     # AWG UDP ports
     local awgp
     for awgp in "${AWG1_PORT}" "${AWG2_PORT}" "${AWG3_PORT}" "${AWG4_PORT}" "${AWG5_PORT}" "${AWG6_PORT}" "${AWG7_PORT}" "${AWG8_PORT}" "${AWG9_PORT}" "${AMNEZIAWG_PORT}"; do
@@ -4271,12 +4409,19 @@ status_and_diagnostics() {
     fi
 
     echo ""
-    if (( failc == 0 )); then
-        echo -e "  ${GREEN}Итог диагностики: OK (${okc} проверок)${NC}"
-    else
-        echo -e "  ${YELLOW}Итог диагностики: ${failc} замечаний, ${okc} OK${NC}"
+    if (( failc > 0 )); then
+        echo -e "  ${RED}Итог диагностики: КРИТИЧНО — ${failc} ошибок, ${degc} предупреждений, ${okc} OK${NC}"
         echo -e "  Подсказки: journalctl -u x-ui -n 50; journalctl -u AdGuardHome -n 30; nginx -t"
+    elif (( degc > 0 )); then
+        echo -e "  ${YELLOW}Итог диагностики: работает с замечаниями — ${degc} предупреждений, ${okc} OK${NC}"
+    else
+        echo -e "  ${GREEN}Итог диагностики: OK (${okc} проверок)${NC}"
     fi
+    echo -e "  Диагностика проверяет сервер локально; работу клиентов проверьте подключением."
     echo -e "${BLUE}══════════════════════════════════════════════════════════════════════${NC}"
+    DIAG_FAILED="$failc"
 }
+DIAG_FAILED=0
 status_and_diagnostics
+trap - EXIT
+(( DIAG_FAILED == 0 )) || exit 2
