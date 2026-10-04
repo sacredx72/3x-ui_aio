@@ -1,0 +1,4 @@
+aio.env
+*.log
+*-credentials.txt
+install-result.env

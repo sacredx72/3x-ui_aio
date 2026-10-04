@@ -1,0 +1,87 @@
+[
+  {
+    "type": "field",
+    "inboundTag": [
+      "api"
+    ],
+    "outboundTag": "api"
+  },
+  {
+    "type": "field",
+    "ip": [
+      "geoip:private"
+    ],
+    "outboundTag": "blocked"
+  },
+  {
+    "type": "field",
+    "protocol": [
+      "bittorrent"
+    ],
+    "outboundTag": "blocked"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:category-ads",
+      "ext:geosite_ROSCOM.dat:win-spy",
+      "ext:geosite_ROSCOM.dat:torrent"
+    ],
+    "outboundTag": "blocked"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:whitelist",
+      "ext:geosite_ROSCOM.dat:category-ru"
+    ],
+    "outboundTag": "direct"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:apple",
+      "ext:geosite_ROSCOM.dat:microsoft",
+      "ext:geosite_ROSCOM.dat:steam",
+      "ext:geosite_ROSCOM.dat:riot",
+      "ext:geosite_ROSCOM.dat:escapefromtarkov",
+      "ext:geosite_ROSCOM.dat:faceit",
+      "ext:geosite_ROSCOM.dat:twitch",
+      "ext:geosite_ROSCOM.dat:pinterest"
+    ],
+    "outboundTag": "direct"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:category-geoblock-ru",
+      "ext:geosite_ROSCOM.dat:google-deepmind"
+    ],
+    "outboundTag": "AWG_RUtoFI"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:google-play",
+      "ext:geosite_ROSCOM.dat:github",
+      "ext:geosite_ROSCOM.dat:telegram"
+    ],
+    "outboundTag": "AWG_RUtoFI"
+  },
+  {
+    "type": "field",
+    "domain": [
+      "ext:geosite_ROSCOM.dat:youtube",
+      "ext:geosite_ROSCOM.dat:twitch-ads"
+    ],
+    "outboundTag": "warp"
+  },
+  {
+    "type": "field",
+    "ip": [
+      "ext:geoip_ROSCOM.dat:direct",
+      "ext:geoip_ROSCOM.dat:whitelist"
+    ],
+    "outboundTag": "AWG_RUtoFI"
+  }
+]
